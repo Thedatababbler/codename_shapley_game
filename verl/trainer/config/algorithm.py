@@ -17,7 +17,14 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "DiffusionAlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "DiffusionAlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "PNSRedistributionConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -614,6 +621,40 @@ class RolloutCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class PNSRedistributionConfig(BaseConfig):
+    """Configuration for PNS-based step-level reward redistribution.
+
+    When enabled, the trajectory-level reward is redistributed across
+    reasoning steps according to PNS (Process Necessity Score) signals
+    before advantage estimation.
+
+    Args:
+        enable: Whether to enable PNS reward redistribution.
+        alpha: Interpolation coefficient in [0, 1].  0 = fully uniform, 1 = fully PNS-driven.
+        eps: Numerical stability constant.
+        mode: PNS model output type: "regression" (raw scores) or "classification" (probabilities).
+        pns_values: Class-to-value mapping for classification mode.
+        variant: Redistribution variant: "uniform" (ablation A), "direct_normalized" (ablation B),
+            or "surplus" (default, main method C).
+        step_segmenter: Name of the registered step segmenter strategy.
+        pns_score_key: Key in non_tensor_batch for pre-computed PNS scores.
+        pns_scorer_path: Optional path to a Python file containing a PNS scoring function.
+        pns_scorer_name: Function name inside pns_scorer_path. Default "score_steps".
+    """
+
+    enable: bool = False
+    alpha: float = 0.5
+    eps: float = 1e-8
+    mode: str = "regression"
+    pns_values: list[float] = field(default_factory=lambda: [0.0, 1 / 3, 2 / 3, 1.0])
+    variant: str = "surplus"
+    step_segmenter: str = "double_newline"
+    pns_score_key: str = "pns_scores"
+    pns_scorer_path: Optional[str] = None
+    pns_scorer_name: str = "score_steps"
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -667,6 +708,9 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    # PNS (Process Necessity Score) step-level reward redistribution.
+    # Set to None to disable.  Use PNSRedistributionConfig(enable=True) to activate.
+    pns_redistribution: Optional[PNSRedistributionConfig] = None
 
 
 @dataclass

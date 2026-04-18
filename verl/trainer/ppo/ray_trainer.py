@@ -1505,6 +1505,29 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # PNS step-level reward redistribution (optional)
+                        pns_cfg = self.config.algorithm.get("pns_redistribution", None)
+                        if pns_cfg is not None and pns_cfg.get("enable", False):
+                            from verl.utils.pns_reward_redistributor import redistribute_token_rewards_with_pns
+
+                            pns_scorer = None
+                            scorer_path = pns_cfg.get("pns_scorer_path", None)
+                            if scorer_path is not None:
+                                from verl.utils.import_utils import load_extern_object
+
+                                pns_scorer = load_extern_object(
+                                    module_path=scorer_path,
+                                    object_name=pns_cfg.get("pns_scorer_name", "score_steps"),
+                                )
+
+                            batch, pns_metrics = redistribute_token_rewards_with_pns(
+                                batch=batch,
+                                tokenizer=self.tokenizer,
+                                pns_config=dict(pns_cfg),
+                                pns_scorer=pns_scorer,
+                            )
+                            metrics.update(pns_metrics)
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
