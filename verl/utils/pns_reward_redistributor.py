@@ -138,10 +138,31 @@ def redistribute_token_rewards_with_pns(
         if has_precomputed:
             raw_scores = batch.non_tensor_batch[pns_score_key][i]
             if isinstance(raw_scores, np.ndarray):
+                if np.isnan(raw_scores).any():
+                    logger.warning(
+                        "Sample %d: pns_scores contains NaN; "
+                        "skipping PNS redistribution for this sample.",
+                        i,
+                    )
+                    continue
                 pns_output = torch.from_numpy(raw_scores).float()
             elif isinstance(raw_scores, torch.Tensor):
+                if raw_scores.isnan().any():
+                    logger.warning(
+                        "Sample %d: pns_scores contains NaN; "
+                        "skipping PNS redistribution for this sample.",
+                        i,
+                    )
+                    continue
                 pns_output = raw_scores.float()
             elif isinstance(raw_scores, (list, tuple)):
+                if any(v is None for v in raw_scores):
+                    logger.warning(
+                        "Sample %d: pns_scores contains None values; "
+                        "skipping PNS redistribution for this sample.",
+                        i,
+                    )
+                    continue
                 pns_output = torch.tensor(raw_scores, dtype=torch.float32)
             else:
                 logger.warning(
