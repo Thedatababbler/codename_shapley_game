@@ -8,6 +8,13 @@
 **/playground
 **/wandb
 
+**/*.whl
+/data/
+/scripts/*.log
+/scripts/grpo_*-*.log
+/scripts/setup_verl-*.log
+/scripts/pull_verl_sif-*.log
+
 /pyrightconfig.json
 
 # Byte-compiled / optimized / DLL files
