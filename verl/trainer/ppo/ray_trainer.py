@@ -1520,10 +1520,12 @@ class RayPPOTrainer:
                                     object_name=pns_cfg.get("pns_scorer_name", "score_steps"),
                                 )
 
+                            pns_cfg_dict = dict(pns_cfg)
+                            pns_cfg_dict["_global_step"] = self.global_steps
                             batch, pns_metrics = redistribute_token_rewards_with_pns(
                                 batch=batch,
                                 tokenizer=self.tokenizer,
-                                pns_config=dict(pns_cfg),
+                                pns_config=pns_cfg_dict,
                                 pns_scorer=pns_scorer,
                             )
                             metrics.update(pns_metrics)

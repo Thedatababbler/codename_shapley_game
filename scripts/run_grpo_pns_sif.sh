@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH -p aisc
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=48
 #SBATCH --mem=512G
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:6
+#SBATCH --exclude=aisct03
 #SBATCH --job-name=grpo_pns_sif
 #SBATCH --output=scripts/grpo_pns_sif-%j.log
 #SBATCH --error=scripts/grpo_pns_sif-%j.log
@@ -38,11 +39,17 @@ export WANDB_API_KEY="${WANDB_API_KEY:?WANDB_API_KEY not set; run: export WANDB_
 export NCCL_CUMEM_ENABLE=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HYDRA_FULL_ERROR=1
+export VERL_LOGGING_LEVEL=INFO
 
 export RAY_TMPDIR="/tmp/ray_verl_${SLURM_JOB_ID}"
 mkdir -p "${RAY_TMPDIR}"
 export RAY_DEDUP_LOGS=0
 export RAY_OBJECT_STORE_MEMORY=$((30*1024*1024*1024))
+export PNS_STEP_SCORE_LOG_DIR="${VERL_DIR}/outputs/pns_step_scores"
+mkdir -p "${PNS_STEP_SCORE_LOG_DIR}"
+export PNS_STEP_SCORE_LOG_PATH="${PNS_STEP_SCORE_LOG_DIR}/grpo_pns_${SLURM_JOB_ID}.jsonl"
+export PNS_STEP_SCORE_STDOUT_SAMPLES="${PNS_STEP_SCORE_STDOUT_SAMPLES:-2}"
+export PNS_STEP_SCORE_PREVIEW_CHARS="${PNS_STEP_SCORE_PREVIEW_CHARS:-200}"
 
 # PYTHONPATH 让容器内 python 优先用 RDS 上我们改过的 verl
 export PYTHONPATH="${VERL_DIR}:${PYTHONPATH:-}"
@@ -78,12 +85,12 @@ prepare_data_in_container() {
 prepare_data_in_container
 
 # ─── 训练超参 ───
-N_GPUS=8
-TP_SIZE=2
-TRAIN_BATCH_SIZE=256
+N_GPUS=6
+TP_SIZE=1
+TRAIN_BATCH_SIZE=96
 ROLLOUT_N=5
-MINI_BATCH_SIZE=64
-MICRO_BATCH_SIZE=8
+MINI_BATCH_SIZE=24
+MICRO_BATCH_SIZE=6
 MAX_PROMPT_LEN=1024
 MAX_RESPONSE_LEN=2048
 TOTAL_EPOCHS=15
@@ -112,6 +119,7 @@ echo "Rollout N:    ${ROLLOUT_N}"
 echo "Epochs:       ${TOTAL_EPOCHS}"
 echo "PNS α:        ${PNS_ALPHA}"
 echo "SIF:          ${SIF}"
+echo "PNS step log: ${PNS_STEP_SCORE_LOG_PATH}"
 echo "=========================================="
 echo ""
 
@@ -150,12 +158,13 @@ CMD=(
     actor_rollout_ref.actor.kl_loss_coef=0.001
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.entropy_coeff=0
-    actor_rollout_ref.actor.fsdp_config.param_offload=False
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    actor_rollout_ref.actor.fsdp_config.param_offload=True
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
 
     actor_rollout_ref.rollout.name=sglang
     actor_rollout_ref.rollout.tensor_model_parallel_size=${TP_SIZE}
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.30
+    actor_rollout_ref.rollout.multi_stage_wake_up=true
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24000
 
@@ -165,8 +174,8 @@ CMD=(
 
     trainer.critic_warmup=0
     trainer.logger='["console","wandb"]'
-    trainer.project_name=verl_grpo_pns
-    trainer.experiment_name=qwen2.5_7b_grpo_pns
+    trainer.project_name='pns rl'
+    trainer.experiment_name=qwen2.5_7b_grpo_pns_scorer_v3
     trainer.n_gpus_per_node=${N_GPUS}
     trainer.nnodes=1
     trainer.save_freq=${SAVE_FREQ}
@@ -218,10 +227,14 @@ singularity exec --nv \
     --env NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE}" \
     --env CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS}" \
     --env HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR}" \
+    --env VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL}" \
     --env RAY_TMPDIR="${RAY_TMPDIR}" \
     --env RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS}" \
     --env RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY}" \
     --env PNS_DEBERTA_CKPT="${PNS_DEBERTA_CKPT}" \
+    --env PNS_STEP_SCORE_LOG_PATH="${PNS_STEP_SCORE_LOG_PATH}" \
+    --env PNS_STEP_SCORE_STDOUT_SAMPLES="${PNS_STEP_SCORE_STDOUT_SAMPLES}" \
+    --env PNS_STEP_SCORE_PREVIEW_CHARS="${PNS_STEP_SCORE_PREVIEW_CHARS}" \
     --env PYTHONPATH="${PYTHONPATH}" \
     --pwd "${VERL_DIR}" \
     "${SIF}" \

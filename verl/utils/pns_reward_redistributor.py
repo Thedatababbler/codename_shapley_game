@@ -12,6 +12,7 @@ module can call a user-supplied scoring function to produce them on the fly.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Callable, Optional
@@ -53,6 +54,70 @@ def _extract_valid_response(
     valid_len = attention_mask[prompt_length:].sum().int().item()
     valid_ids = responses[:valid_len]
     return valid_ids, prompt_length, response_length
+
+
+def _append_step_score_record(
+    *,
+    log_path: Optional[str],
+    global_step: Optional[int],
+    sample_idx: int,
+    final_reward: float,
+    segments: list[StepSegment],
+    scores: torch.Tensor,
+    shares: torch.Tensor,
+    step_rewards: torch.Tensor,
+) -> None:
+    if not log_path:
+        return
+
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    record = {
+        "global_step": int(global_step) if global_step is not None else None,
+        "sample_index_in_batch": int(sample_idx),
+        "final_reward": float(final_reward),
+        "num_steps": len(segments),
+        "steps": [
+            {
+                "step_index": step_idx,
+                "text": seg.text,
+                "pns_score": float(score),
+                "share": float(share),
+                "step_reward": float(step_reward),
+            }
+            for step_idx, (seg, score, share, step_reward) in enumerate(
+                zip(segments, scores.tolist(), shares.tolist(), step_rewards.tolist())
+            )
+        ],
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _format_step_preview(
+    *,
+    segments: list[StepSegment],
+    scores: torch.Tensor,
+    shares: torch.Tensor,
+    step_rewards: torch.Tensor,
+    preview_chars: int,
+) -> list[dict[str, Any]]:
+    preview = []
+    for step_idx, (seg, score, share, step_reward) in enumerate(
+        zip(segments, scores.tolist(), shares.tolist(), step_rewards.tolist())
+    ):
+        text = seg.text.replace("\n", "\\n")
+        if len(text) > preview_chars:
+            text = text[:preview_chars] + "..."
+        preview.append(
+            {
+                "step_index": step_idx,
+                "text": text,
+                "pns_score": round(float(score), 4),
+                "share": round(float(share), 4),
+                "step_reward": round(float(step_reward), 4),
+            }
+        )
+    return preview
 
 
 def redistribute_token_rewards_with_pns(
@@ -100,6 +165,10 @@ def redistribute_token_rewards_with_pns(
     pns_score_key = pns_config.get("pns_score_key", "pns_scores")
 
     pns_values = torch.tensor(pns_values_list, dtype=torch.float32) if mode == "classification" else None
+    global_step = pns_config.get("_global_step", None)
+    step_score_log_path = os.getenv("PNS_STEP_SCORE_LOG_PATH")
+    step_score_stdout_samples = int(os.getenv("PNS_STEP_SCORE_STDOUT_SAMPLES", "2"))
+    step_score_preview_chars = int(os.getenv("PNS_STEP_SCORE_PREVIEW_CHARS", "160"))
 
     B = batch.batch["token_level_scores"].shape[0]
     response_length = batch.batch["token_level_scores"].shape[1]
@@ -108,6 +177,10 @@ def redistribute_token_rewards_with_pns(
     all_shares_list: list[torch.Tensor] = []
     all_step_rewards_list: list[torch.Tensor] = []
     final_rewards_list: list[float] = []
+    per_position_scores: dict[int, list[float]] = {}
+    per_position_shares: dict[int, list[float]] = {}
+    per_position_rewards: dict[int, list[float]] = {}
+    stdout_logged_samples = 0
 
     new_token_level_scores = batch.batch["token_level_scores"].clone()
 
@@ -201,6 +274,38 @@ def redistribute_token_rewards_with_pns(
         all_scores_list.append(result["scores"].detach())
         all_shares_list.append(result["shares"].detach())
         all_step_rewards_list.append(result["step_rewards"].detach())
+        for pos, value in enumerate(result["scores"].tolist()):
+            per_position_scores.setdefault(pos, []).append(float(value))
+        for pos, value in enumerate(result["shares"].tolist()):
+            per_position_shares.setdefault(pos, []).append(float(value))
+        for pos, value in enumerate(result["step_rewards"].tolist()):
+            per_position_rewards.setdefault(pos, []).append(float(value))
+
+        _append_step_score_record(
+            log_path=step_score_log_path,
+            global_step=global_step,
+            sample_idx=i,
+            final_reward=R.item(),
+            segments=segments,
+            scores=result["scores"].detach(),
+            shares=result["shares"].detach(),
+            step_rewards=result["step_rewards"].detach(),
+        )
+        if stdout_logged_samples < step_score_stdout_samples:
+            logger.info(
+                "PNS step scores | global_step=%s sample=%d final_reward=%.4f steps=%s",
+                global_step,
+                i,
+                R.item(),
+                _format_step_preview(
+                    segments=segments,
+                    scores=result["scores"].detach(),
+                    shares=result["shares"].detach(),
+                    step_rewards=result["step_rewards"].detach(),
+                    preview_chars=step_score_preview_chars,
+                ),
+            )
+            stdout_logged_samples += 1
 
         token_spans = map_steps_to_token_spans(
             response_ids=valid_ids,
@@ -228,5 +333,12 @@ def redistribute_token_rewards_with_pns(
             all_step_rewards=all_step_rewards_list,
             all_final_rewards=torch.tensor(final_rewards_list, dtype=torch.float32),
         )
+        for pos, values in per_position_scores.items():
+            metrics[f"pns/step_{pos}_score_mean"] = float(np.mean(values))
+            metrics[f"pns/step_{pos}_score_std"] = float(np.std(values))
+        for pos, values in per_position_shares.items():
+            metrics[f"pns/step_{pos}_share_mean"] = float(np.mean(values))
+        for pos, values in per_position_rewards.items():
+            metrics[f"pns/step_{pos}_reward_mean"] = float(np.mean(values))
 
     return batch, metrics
