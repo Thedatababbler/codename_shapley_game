@@ -27,6 +27,7 @@ from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -71,6 +72,26 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+class PNSScorerRayActor:
+    """Dedicated Ray actor for online PNS scoring.
+
+    The trainer process often has no GPU allocation, so loading DeBERTa there
+    falls back to CPU. Running the external scorer inside a Ray actor with
+    ``num_gpus=1`` gives it a separate CUDA device.
+    """
+
+    def __init__(self, module_path: str, object_name: str):
+        from verl.utils.import_utils import load_extern_object
+
+        self.scorer = load_extern_object(module_path=module_path, object_name=object_name)
+
+    def score_batches(self, step_text_batches: list[list[str]]):
+        batch_scorer = getattr(self.scorer, "score_batches", None)
+        if callable(batch_scorer):
+            return batch_scorer(step_text_batches)
+        return [self.scorer(step_texts) for step_texts in step_text_batches]
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -300,6 +321,8 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self._pns_scorer_actor = None
+        self._pns_scorer_actor_key = None
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -1513,12 +1536,29 @@ class RayPPOTrainer:
                             pns_scorer = None
                             scorer_path = pns_cfg.get("pns_scorer_path", None)
                             if scorer_path is not None:
-                                from verl.utils.import_utils import load_extern_object
+                                scorer_name = pns_cfg.get("pns_scorer_name", "score_steps")
+                                if pns_cfg.get("scorer_ray_actor", False):
+                                    actor_key = (scorer_path, scorer_name)
+                                    if self._pns_scorer_actor is None or self._pns_scorer_actor_key != actor_key:
+                                        scorer_num_gpus = float(pns_cfg.get("scorer_num_gpus", 1))
+                                        scorer_num_cpus = int(pns_cfg.get("scorer_num_cpus", 4))
+                                        scorer_actor_cls = ray.remote(
+                                            num_gpus=scorer_num_gpus,
+                                            num_cpus=scorer_num_cpus,
+                                        )(PNSScorerRayActor)
+                                        self._pns_scorer_actor = scorer_actor_cls.remote(
+                                            module_path=scorer_path,
+                                            object_name=scorer_name,
+                                        )
+                                        self._pns_scorer_actor_key = actor_key
+                                    pns_scorer = self._pns_scorer_actor
+                                else:
+                                    from verl.utils.import_utils import load_extern_object
 
-                                pns_scorer = load_extern_object(
-                                    module_path=scorer_path,
-                                    object_name=pns_cfg.get("pns_scorer_name", "score_steps"),
-                                )
+                                    pns_scorer = load_extern_object(
+                                        module_path=scorer_path,
+                                        object_name=scorer_name,
+                                    )
 
                             pns_cfg_dict = dict(pns_cfg)
                             pns_cfg_dict["_global_step"] = self.global_steps

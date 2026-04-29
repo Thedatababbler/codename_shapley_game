@@ -243,6 +243,9 @@ pytest tests/utils/test_pns_reward_allocation.py -v
 | `pns_score_key` | str | `"pns_scores"` | Key in `non_tensor_batch` for pre-computed scores |
 | `pns_scorer_path` | str | `null` | Path to external scorer Python file |
 | `pns_scorer_name` | str | `"score_steps"` | Function name in scorer file |
+| `scorer_ray_actor` | bool | `false` | Run the external scorer in a dedicated Ray actor instead of the trainer process |
+| `scorer_num_gpus` | float | `1` | GPU resources reserved for the scorer actor when `scorer_ray_actor=true` |
+| `scorer_num_cpus` | int | `4` | CPU resources reserved for the scorer actor when `scorer_ray_actor=true` |
 
 ## Online DeBERTa Scoring Notes
 
@@ -250,6 +253,19 @@ The current trained scorer returns scalar scores in `{0.0, 1.0, 2.0}`, so the
 training scripts set `++algorithm.pns_redistribution.mode=regression`. Do not use
 `classification` unless the scorer returns class probabilities/logits shaped
 `[num_steps, num_classes]`.
+
+For online DeBERTa scoring during GRPO, prefer a dedicated Ray scorer actor:
+
+```bash
+++algorithm.pns_redistribution.scorer_ray_actor=true \
+++algorithm.pns_redistribution.scorer_num_gpus=1 \
+++algorithm.pns_redistribution.scorer_num_cpus=4
+```
+
+The provided Singularity launch script requests 5 GPUs but keeps
+`trainer.n_gpus_per_node=4`: four GPUs are used by actor/rollout/ref workers and
+one GPU is reserved for the DeBERTa scorer actor. This avoids the trainer driver
+falling back to CPU for PNS scoring.
 
 When using the bundled DeBERTa scorer online, PNS redistribution logs:
 

@@ -272,22 +272,31 @@ def redistribute_token_rewards_with_pns(
     if external_step_batches and pns_scorer is not None:
         scoring_start = time.perf_counter()
         batch_scorer = getattr(pns_scorer, "score_batches", None)
-        if callable(batch_scorer):
+        if hasattr(batch_scorer, "remote"):
+            import ray
+
+            batched_outputs = ray.get(batch_scorer.remote(external_step_batches))
+            used_batch_scorer = True
+            used_ray_actor = True
+        elif callable(batch_scorer):
             batched_outputs = batch_scorer(external_step_batches)
             used_batch_scorer = True
+            used_ray_actor = False
         else:
             batched_outputs = [pns_scorer(step_texts) for step_texts in external_step_batches]
             used_batch_scorer = False
+            used_ray_actor = False
 
         pns_scoring_seconds = time.perf_counter() - scoring_start
         total_external_steps = sum(len(step_texts) for step_texts in external_step_batches)
         logger.info(
-            "PNS external scoring | global_step=%s samples=%d steps=%d seconds=%.2f batch_mode=%s",
+            "PNS external scoring | global_step=%s samples=%d steps=%d seconds=%.2f batch_mode=%s ray_actor=%s",
             global_step,
             len(external_step_batches),
             total_external_steps,
             pns_scoring_seconds,
             used_batch_scorer,
+            used_ray_actor,
         )
 
         if len(batched_outputs) != len(external_score_record_indices):

@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -p aisc
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=48
-#SBATCH --mem=512G
+#SBATCH --cpus-per-task=40
+#SBATCH --mem=400G
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:6
+#SBATCH --gres=gpu:5
 #SBATCH --exclude=aisct03
 #SBATCH --job-name=grpo_pns_official
 #SBATCH --output=scripts/grpo_pns_official-%j.log
@@ -42,7 +42,7 @@ export PYTHONPATH="${VERL_DIR}:${PYTHONPATH:-}"
 export RAY_TMPDIR="/tmp/ray_verl_${SLURM_JOB_ID}"
 mkdir -p "${RAY_TMPDIR}"
 export RAY_DEDUP_LOGS=0
-export RAY_OBJECT_STORE_MEMORY=$((30*1024*1024*1024))
+export RAY_OBJECT_STORE_MEMORY=$((20*1024*1024*1024))
 
 # PNS scorer and detailed per-step logging.
 export PNS_DEBERTA_CKPT="${PNS_DEBERTA_CKPT:-/mnt/rds/VipinRDS/VipinRDS/users/yxs1432/causal_rl/pns_scorer/checkpoints/deberta_pn_scorer_v3/best}"
@@ -110,7 +110,7 @@ singularity exec --nv \
         algorithm.adv_estimator=grpo \
         data.train_files="${train_files}" \
         data.val_files="${test_files}" \
-        data.train_batch_size=96 \
+        data.train_batch_size=64 \
         data.max_prompt_length=1024 \
         data.max_response_length=2048 \
         data.filter_overlong_prompts=True \
@@ -118,7 +118,7 @@ singularity exec --nv \
         actor_rollout_ref.model.path="${model_path}" \
         actor_rollout_ref.actor.optim.lr=1e-6 \
         actor_rollout_ref.model.use_remove_padding=True \
-        actor_rollout_ref.actor.ppo_mini_batch_size=24 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=16 \
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.actor.use_kl_loss=True \
         actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -132,7 +132,7 @@ singularity exec --nv \
         actor_rollout_ref.rollout.name=sglang \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
         actor_rollout_ref.rollout.multi_stage_wake_up=True \
-        actor_rollout_ref.rollout.n=5 \
+        actor_rollout_ref.rollout.n=4 \
         actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
@@ -140,18 +140,21 @@ singularity exec --nv \
         trainer.logger='["console"]' \
         trainer.project_name='pns rl' \
         trainer.experiment_name='qwen2.5_7b_grpo_pns_scorer_v3_official_style' \
-        trainer.n_gpus_per_node=6 \
+        trainer.n_gpus_per_node=4 \
         trainer.nnodes=1 \
         trainer.save_freq=5 \
         trainer.test_freq=3 \
         trainer.total_epochs=15 \
-        ray_kwargs.ray_init.num_cpus="${SLURM_CPUS_PER_TASK:-48}" \
+        ray_kwargs.ray_init.num_cpus="${SLURM_CPUS_PER_TASK:-40}" \
         ++ray_kwargs.ray_init.include_dashboard=false \
         ++algorithm.pns_redistribution.enable=true \
         ++algorithm.pns_redistribution.alpha=0.5 \
         ++algorithm.pns_redistribution.mode=regression \
         ++algorithm.pns_redistribution.variant=surplus \
         ++algorithm.pns_redistribution.step_segmenter=double_newline \
+        ++algorithm.pns_redistribution.scorer_ray_actor=true \
+        ++algorithm.pns_redistribution.scorer_num_gpus=1 \
+        ++algorithm.pns_redistribution.scorer_num_cpus=4 \
         ++algorithm.pns_redistribution.pns_scorer_path="${VERL_DIR}/verl/utils/pns_deberta_scorer.py" \
         ++algorithm.pns_redistribution.pns_scorer_name=score_steps
 
