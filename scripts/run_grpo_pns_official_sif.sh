@@ -16,7 +16,6 @@
 # environment wrapper, and append PNS-specific overrides at the end.
 
 set -euo pipefail
-set -x
 
 module purge 2>/dev/null || true
 module load singularity/4.3.4
@@ -32,10 +31,8 @@ if [[ ! -f "${SIF}" ]]; then
     exit 1
 fi
 
-WANDB_API_KEY="${WANDB_API_KEY:?WANDB_API_KEY must be exported or passed via sbatch --export}"
 export HF_HOME=/mnt/rds/VipinRDS/VipinRDS/users/yxs1432/.cache
 export HF_HUB_CACHE="${HF_HOME}/hub"
-export WANDB_API_KEY
 export HYDRA_FULL_ERROR=1
 export NCCL_CUMEM_ENABLE=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -54,6 +51,8 @@ mkdir -p "${PNS_STEP_SCORE_LOG_DIR}"
 export PNS_STEP_SCORE_LOG_PATH="${PNS_STEP_SCORE_LOG_DIR}/grpo_pns_${SLURM_JOB_ID}.jsonl"
 export PNS_STEP_SCORE_STDOUT_SAMPLES="${PNS_STEP_SCORE_STDOUT_SAMPLES:-2}"
 export PNS_STEP_SCORE_PREVIEW_CHARS="${PNS_STEP_SCORE_PREVIEW_CHARS:-200}"
+export PNS_DEBERTA_BATCH_SIZE="${PNS_DEBERTA_BATCH_SIZE:-128}"
+export PNS_DEBERTA_MAX_LENGTH="${PNS_DEBERTA_MAX_LENGTH:-512}"
 
 model_path="${ACTOR_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 gsm8k_train_path="${VERL_DIR}/data/gsm8k/train.parquet"
@@ -91,7 +90,6 @@ singularity exec --nv \
     --bind /tmp:/tmp \
     --env HF_HOME="${HF_HOME}" \
     --env HF_HUB_CACHE="${HF_HUB_CACHE}" \
-    --env WANDB_API_KEY="${WANDB_API_KEY}" \
     --env HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR}" \
     --env NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE}" \
     --env CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS}" \
@@ -104,6 +102,8 @@ singularity exec --nv \
     --env PNS_STEP_SCORE_LOG_PATH="${PNS_STEP_SCORE_LOG_PATH}" \
     --env PNS_STEP_SCORE_STDOUT_SAMPLES="${PNS_STEP_SCORE_STDOUT_SAMPLES}" \
     --env PNS_STEP_SCORE_PREVIEW_CHARS="${PNS_STEP_SCORE_PREVIEW_CHARS}" \
+    --env PNS_DEBERTA_BATCH_SIZE="${PNS_DEBERTA_BATCH_SIZE}" \
+    --env PNS_DEBERTA_MAX_LENGTH="${PNS_DEBERTA_MAX_LENGTH}" \
     --pwd "${VERL_DIR}" \
     "${SIF}" \
     python3 -m verl.trainer.main_ppo \
@@ -119,7 +119,7 @@ singularity exec --nv \
         actor_rollout_ref.actor.optim.lr=1e-6 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.ppo_mini_batch_size=24 \
-        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=6 \
+        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.actor.use_kl_loss=True \
         actor_rollout_ref.actor.kl_loss_coef=0.001 \
         actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -127,17 +127,17 @@ singularity exec --nv \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
         actor_rollout_ref.actor.fsdp_config.param_offload=True \
         actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=6 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
         actor_rollout_ref.rollout.name=sglang \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
         actor_rollout_ref.rollout.multi_stage_wake_up=True \
         actor_rollout_ref.rollout.n=5 \
-        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=6 \
+        actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.use_kl_in_reward=False \
         trainer.critic_warmup=0 \
-        trainer.logger='["console","wandb"]' \
+        trainer.logger='["console"]' \
         trainer.project_name='pns rl' \
         trainer.experiment_name='qwen2.5_7b_grpo_pns_scorer_v3_official_style' \
         trainer.n_gpus_per_node=6 \
@@ -149,8 +149,7 @@ singularity exec --nv \
         ++ray_kwargs.ray_init.include_dashboard=false \
         ++algorithm.pns_redistribution.enable=true \
         ++algorithm.pns_redistribution.alpha=0.5 \
-        ++algorithm.pns_redistribution.mode=classification \
-        ++algorithm.pns_redistribution.pns_values='[0.0,1.0,2.0]' \
+        ++algorithm.pns_redistribution.mode=regression \
         ++algorithm.pns_redistribution.variant=surplus \
         ++algorithm.pns_redistribution.step_segmenter=double_newline \
         ++algorithm.pns_redistribution.pns_scorer_path="${VERL_DIR}/verl/utils/pns_deberta_scorer.py" \

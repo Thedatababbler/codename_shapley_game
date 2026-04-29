@@ -76,7 +76,8 @@ tests/
 | `pns_reward_allocation.py` | Implements the core formula: `r_t = (1-α)·R/T + α·R·φ_t` where `φ_t` is the normalized surplus share. Includes 3 ablation variants (uniform, direct normalized, surplus). |
 | `pns_step_segmenter.py` | Registry-based step segmentation. Built-in strategies: `double_newline`, `step_marker`, `think_tag`, `sentence`. Easy to extend with `@register_segmenter("name")`. |
 | `pns_token_mapping.py` | Maps step character boundaries to token indices using HuggingFace `offset_mapping`. Falls back to proportional allocation when re-encoding doesn't match rollout tokens. |
-| `pns_reward_redistributor.py` | Orchestrates the full pipeline per batch. Reads PNS scores from `non_tensor_batch` or calls a user-supplied scorer function. |
+| `pns_reward_redistributor.py` | Orchestrates the full pipeline per batch. Reads PNS scores from `non_tensor_batch` or calls a user-supplied scorer function. External scorer calls are batched across the whole RL batch when the scorer exposes `score_batches`. |
+| `pns_deberta_scorer.py` | DeBERTa-v3-large external scorer wrapper. It supports both `score_steps(step_texts)` for compatibility and batched `score_step_batches(step_text_batches)` for faster online scoring. |
 
 ## Mathematical Formulation
 
@@ -157,9 +158,37 @@ def score_steps(step_texts: list[str]) -> list[float]:
     return model.predict(step_texts)
 ```
 
+For high-throughput online scoring, the scorer may also expose a batched API:
+
+```python
+def score_step_batches(step_text_batches: list[list[str]]) -> list[list[float]]:
+    """Score all rollout samples in one batched model pass."""
+    return model.predict_batches(step_text_batches)
+```
+
+`redistribute_token_rewards_with_pns()` automatically uses `score_steps.score_batches`
+when present. The included DeBERTa scorer attaches this batched API by default, so
+an RL batch is scored as one large DeBERTa workload instead of hundreds of small
+per-sample calls.
+
+The included DeBERTa scorer is configured through environment variables:
+
+| Environment Variable | Default | Description |
+|----------------------|---------|-------------|
+| `PNS_DEBERTA_CKPT` | required | Local checkpoint directory for the trained PN/PNS scorer |
+| `PNS_DEBERTA_DEVICE` | auto | Override scorer device, e.g. `cuda` or `cpu` |
+| `PNS_DEBERTA_BATCH_SIZE` | `128` | Batch size for DeBERTa step scoring |
+| `PNS_DEBERTA_MAX_LENGTH` | `512` | Tokenizer truncation length for each formatted step example |
+
 ### 3. Run training
 
-No other changes needed. Run verl training as usual:
+No other changes needed. Run verl training as usual, or use the provided launch
+scripts:
+
+| Script | Environment | Notes |
+|--------|-------------|-------|
+| `scripts/run_grpo_pns_official_sif.sh` | Singularity | Recommended cluster entrypoint. Mirrors verl's official example style while using the prebuilt `verl_sgl059.sif` image. |
+| `scripts/run_grpo_pns.sh` | Python venv | Non-container fallback using the local `envs/verl_sglang` Python environment. |
 
 ```bash
 python -m verl.trainer.main_ppo \
@@ -214,6 +243,23 @@ pytest tests/utils/test_pns_reward_allocation.py -v
 | `pns_score_key` | str | `"pns_scores"` | Key in `non_tensor_batch` for pre-computed scores |
 | `pns_scorer_path` | str | `null` | Path to external scorer Python file |
 | `pns_scorer_name` | str | `"score_steps"` | Function name in scorer file |
+
+## Online DeBERTa Scoring Notes
+
+The current trained scorer returns scalar scores in `{0.0, 1.0, 2.0}`, so the
+training scripts set `++algorithm.pns_redistribution.mode=regression`. Do not use
+`classification` unless the scorer returns class probabilities/logits shaped
+`[num_steps, num_classes]`.
+
+When using the bundled DeBERTa scorer online, PNS redistribution logs:
+
+- `pns/external_scoring_seconds`
+- `pns/external_scoring_samples`
+- `pns/external_scoring_steps`
+
+These metrics are useful for checking whether step scoring is the bottleneck.
+Detailed per-step records are written to `outputs/pns_step_scores/*.jsonl` when
+`PNS_STEP_SCORE_LOG_PATH` is set by the launch script.
 
 ## Step Segmentation Strategies
 

@@ -98,26 +98,9 @@ class DeBERTaPNScorer:
         return "\n".join(parts)
 
     @torch.no_grad()
-    def __call__(
-        self,
-        step_texts: list[str],
-        prompt_text: Optional[str] = None,
-    ) -> torch.Tensor:
-        """Score reasoning steps.
-
-        Returns:
-            Tensor of shape ``[T]`` with scores in {0.0, 1.0, 2.0}.
-        """
-        if not step_texts:
+    def _score_formatted(self, formatted: list[str]) -> torch.Tensor:
+        if not formatted:
             return torch.tensor([], dtype=torch.float32)
-
-        formatted = []
-        for i, step in enumerate(step_texts):
-            formatted.append(self._format_step(
-                current_step=step.strip(),
-                prefix_steps=[s.strip() for s in step_texts[:i]],
-                question=prompt_text,
-            ))
 
         all_scores: list[float] = []
         for start in range(0, len(formatted), self.batch_size):
@@ -138,12 +121,69 @@ class DeBERTaPNScorer:
 
         return torch.tensor(all_scores, dtype=torch.float32)
 
+    def _format_steps_for_sample(
+        self,
+        step_texts: list[str],
+        prompt_text: Optional[str] = None,
+    ) -> list[str]:
+        return [
+            self._format_step(
+                current_step=step.strip(),
+                prefix_steps=[s.strip() for s in step_texts[:i]],
+                question=prompt_text,
+            )
+            for i, step in enumerate(step_texts)
+        ]
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        step_texts: list[str],
+        prompt_text: Optional[str] = None,
+    ) -> torch.Tensor:
+        """Score reasoning steps.
+
+        Returns:
+            Tensor of shape ``[T]`` with scores in {0.0, 1.0, 2.0}.
+        """
+        return self._score_formatted(self._format_steps_for_sample(step_texts, prompt_text))
+
+    @torch.no_grad()
+    def score_batches(
+        self,
+        step_text_batches: list[list[str]],
+        prompt_texts: Optional[list[Optional[str]]] = None,
+    ) -> list[torch.Tensor]:
+        """Score multiple responses in one DeBERTa pass and split results back.
+
+        Each sample keeps the same prefix-step formatting as ``__call__``; this
+        method only batches all formatted examples together for throughput.
+        """
+        if prompt_texts is None:
+            prompt_texts = [None] * len(step_text_batches)
+        if len(prompt_texts) != len(step_text_batches):
+            raise ValueError("prompt_texts must have the same length as step_text_batches")
+
+        lengths: list[int] = []
+        formatted_all: list[str] = []
+        for step_texts, prompt_text in zip(step_text_batches, prompt_texts):
+            formatted = self._format_steps_for_sample(step_texts, prompt_text)
+            lengths.append(len(formatted))
+            formatted_all.extend(formatted)
+
+        flat_scores = self._score_formatted(formatted_all)
+        outputs: list[torch.Tensor] = []
+        offset = 0
+        for length in lengths:
+            outputs.append(flat_scores[offset : offset + length])
+            offset += length
+        return outputs
+
 
 _SINGLETON: Optional[DeBERTaPNScorer] = None
 
 
-def score_steps(step_texts: list[str], **kwargs) -> torch.Tensor:
-    """Module-level scorer function loaded by ``pns_scorer_path``."""
+def _get_singleton() -> DeBERTaPNScorer:
     global _SINGLETON
     if _SINGLETON is None:
         ckpt = os.environ.get("PNS_DEBERTA_CKPT")
@@ -151,5 +191,26 @@ def score_steps(step_texts: list[str], **kwargs) -> torch.Tensor:
             raise RuntimeError(
                 "PNS_DEBERTA_CKPT env var must point to the DeBERTa checkpoint dir"
             )
-        _SINGLETON = DeBERTaPNScorer(ckpt)
-    return _SINGLETON(step_texts, **kwargs)
+        _SINGLETON = DeBERTaPNScorer(
+            ckpt,
+            device=os.environ.get("PNS_DEBERTA_DEVICE"),
+            max_length=int(os.environ.get("PNS_DEBERTA_MAX_LENGTH", "512")),
+            batch_size=int(os.environ.get("PNS_DEBERTA_BATCH_SIZE", "128")),
+        )
+    return _SINGLETON
+
+
+def score_steps(step_texts: list[str], **kwargs) -> torch.Tensor:
+    """Module-level scorer function loaded by ``pns_scorer_path``."""
+    return _get_singleton()(step_texts, **kwargs)
+
+
+def score_step_batches(
+    step_text_batches: list[list[str]],
+    prompt_texts: Optional[list[Optional[str]]] = None,
+) -> list[torch.Tensor]:
+    """Batched scorer entry point used by PNS reward redistribution."""
+    return _get_singleton().score_batches(step_text_batches, prompt_texts=prompt_texts)
+
+
+score_steps.score_batches = score_step_batches

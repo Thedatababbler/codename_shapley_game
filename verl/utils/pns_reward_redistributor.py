@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -36,7 +37,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 __all__ = ["redistribute_token_rewards_with_pns"]
 
-PNSScorerFn = Callable[[list[str]], torch.Tensor]
+PNSScorerFn = Callable[..., torch.Tensor]
 
 
 def _extract_valid_response(
@@ -183,6 +184,10 @@ def redistribute_token_rewards_with_pns(
     stdout_logged_samples = 0
 
     new_token_level_scores = batch.batch["token_level_scores"].clone()
+    sample_records: list[dict[str, Any]] = []
+    external_score_record_indices: list[int] = []
+    external_step_batches: list[list[str]] = []
+    pns_scoring_seconds = 0.0
 
     for i in range(B):
         sample_batch = {k: v[i] for k, v in batch.batch.items()}
@@ -208,6 +213,7 @@ def redistribute_token_rewards_with_pns(
             and batch.non_tensor_batch[pns_score_key][i] is not None
         )
 
+        pns_output: Optional[torch.Tensor] = None
         if has_precomputed:
             raw_scores = batch.non_tensor_batch[pns_score_key][i]
             if isinstance(raw_scores, np.ndarray):
@@ -245,12 +251,70 @@ def redistribute_token_rewards_with_pns(
                 continue
         elif pns_scorer is not None:
             step_texts = [seg.text for seg in segments]
-            pns_output = pns_scorer(step_texts)
-            if not isinstance(pns_output, torch.Tensor):
-                pns_output = torch.tensor(pns_output, dtype=torch.float32)
+            external_score_record_indices.append(len(sample_records))
+            external_step_batches.append(step_texts)
         else:
             continue
 
+        sample_records.append(
+            {
+                "sample_idx": i,
+                "sample_batch": sample_batch,
+                "valid_ids": valid_ids,
+                "resp_len": resp_len,
+                "decoded_text": decoded_text,
+                "segments": segments,
+                "final_reward": R,
+                "pns_output": pns_output,
+            }
+        )
+
+    if external_step_batches and pns_scorer is not None:
+        scoring_start = time.perf_counter()
+        batch_scorer = getattr(pns_scorer, "score_batches", None)
+        if callable(batch_scorer):
+            batched_outputs = batch_scorer(external_step_batches)
+            used_batch_scorer = True
+        else:
+            batched_outputs = [pns_scorer(step_texts) for step_texts in external_step_batches]
+            used_batch_scorer = False
+
+        pns_scoring_seconds = time.perf_counter() - scoring_start
+        total_external_steps = sum(len(step_texts) for step_texts in external_step_batches)
+        logger.info(
+            "PNS external scoring | global_step=%s samples=%d steps=%d seconds=%.2f batch_mode=%s",
+            global_step,
+            len(external_step_batches),
+            total_external_steps,
+            pns_scoring_seconds,
+            used_batch_scorer,
+        )
+
+        if len(batched_outputs) != len(external_score_record_indices):
+            logger.warning(
+                "PNS batch scorer returned %d outputs for %d samples; extra/missing outputs will be ignored.",
+                len(batched_outputs),
+                len(external_score_record_indices),
+            )
+
+        for record_idx, pns_output in zip(external_score_record_indices, batched_outputs):
+            if not isinstance(pns_output, torch.Tensor):
+                pns_output = torch.tensor(pns_output, dtype=torch.float32)
+            sample_records[record_idx]["pns_output"] = pns_output.float()
+
+    for record in sample_records:
+        i = record["sample_idx"]
+        sample_batch = record["sample_batch"]
+        valid_ids = record["valid_ids"]
+        resp_len = record["resp_len"]
+        decoded_text = record["decoded_text"]
+        segments = record["segments"]
+        R = record["final_reward"]
+        pns_output = record["pns_output"]
+        if pns_output is None:
+            continue
+
+        T_steps = len(segments)
         if pns_output.shape[0] != T_steps:
             if pns_output.shape[0] > T_steps:
                 pns_output = pns_output[:T_steps]
@@ -340,5 +404,9 @@ def redistribute_token_rewards_with_pns(
             metrics[f"pns/step_{pos}_share_mean"] = float(np.mean(values))
         for pos, values in per_position_rewards.items():
             metrics[f"pns/step_{pos}_reward_mean"] = float(np.mean(values))
+    if pns_scoring_seconds > 0:
+        metrics["pns/external_scoring_seconds"] = float(pns_scoring_seconds)
+        metrics["pns/external_scoring_samples"] = float(len(external_step_batches))
+        metrics["pns/external_scoring_steps"] = float(sum(len(step_texts) for step_texts in external_step_batches))
 
     return batch, metrics
