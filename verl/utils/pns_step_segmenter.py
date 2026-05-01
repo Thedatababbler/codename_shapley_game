@@ -22,6 +22,11 @@ __all__ = [
 ]
 
 
+# Below this many segments we consider segmentation "too coarse" and try the
+# next fallback strategy in the cascade segmenter.
+_MIN_SEGMENTS_FOR_OK = 2
+
+
 class StepSegment(NamedTuple):
     """A single reasoning step extracted from a response."""
 
@@ -156,3 +161,98 @@ def _segment_sentence(text: str) -> list[StepSegment]:
     if not segments and text.strip():
         segments.append(StepSegment(text=text, char_start=0, char_end=len(text)))
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Additional fallback segmenters
+# ---------------------------------------------------------------------------
+
+
+# Common numbered/bulleted step markers, anchored at start-of-line.
+# Examples that match: "1. ", "1) ", "(1) ", "Step 1:", "step 1.", "第 1 步"
+_NUMBERED_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*("
+    r"step\s+\d+\s*[:.\)]"          # Step 1:  / Step 2.
+    r"|第\s*\d+\s*步\s*[:：.]?"      # 第 1 步:
+    r"|\(?\d+\)[ \t]"               # 1) text  /  (1) text
+    r"|\d+\.[ \t]"                   # 1. text
+    r"|\d+、"                        # 1、text  (Chinese enumeration)
+    r")"
+)
+
+
+@register_segmenter("numbered_marker")
+def _segment_numbered_marker(text: str) -> list[StepSegment]:
+    r"""Split on numbered/enumerated step markers at start of a line.
+
+    Recognises ``1.``, ``1)``, ``(1)``, ``Step 1:``, ``第 1 步:``, ``1、`` etc.
+    Each segment runs from one marker to the next (or end of text).
+    Text before the first marker is included as a separate segment if non-empty.
+    """
+    positions = [m.start() for m in _NUMBERED_MARKER_RE.finditer(text)]
+
+    if not positions:
+        if text.strip():
+            return [StepSegment(text=text, char_start=0, char_end=len(text))]
+        return []
+
+    segments: list[StepSegment] = []
+    if positions[0] > 0:
+        prefix = text[: positions[0]]
+        if prefix.strip():
+            segments.append(StepSegment(text=prefix, char_start=0, char_end=positions[0]))
+
+    for i, start in enumerate(positions):
+        end = positions[i + 1] if i + 1 < len(positions) else len(text)
+        seg_text = text[start:end]
+        if seg_text.strip():
+            segments.append(StepSegment(text=seg_text, char_start=start, char_end=end))
+
+    return segments
+
+
+@register_segmenter("single_newline")
+def _segment_single_newline(text: str) -> list[StepSegment]:
+    r"""Split on any single ``\n`` (treats every non-empty line as a step).
+
+    Empty lines are skipped. Useful when the model emits one reasoning step
+    per line without double newlines.
+    """
+    segments: list[StepSegment] = []
+    for m in re.finditer(r"(?s)(.+?)(?:\n+|$)", text):
+        seg_text = m.group(1)
+        if seg_text.strip():
+            segments.append(StepSegment(text=seg_text, char_start=m.start(1), char_end=m.end(1)))
+    if not segments and text.strip():
+        segments.append(StepSegment(text=text, char_start=0, char_end=len(text)))
+    return segments
+
+
+# Cascade order for the "auto" segmenter. We try coarse-grained markers first
+# (preserve author intent if present) and then progressively finer fallbacks.
+_AUTO_CASCADE: tuple[str, ...] = (
+    "double_newline",
+    "numbered_marker",
+    "step_marker",
+    "single_newline",
+    "sentence",
+)
+
+
+@register_segmenter("auto")
+def _segment_auto(text: str) -> list[StepSegment]:
+    """Cascade segmenter with fallbacks.
+
+    Tries strategies in order: ``double_newline`` → ``numbered_marker`` →
+    ``step_marker`` → ``single_newline`` → ``sentence``. Stops at the first
+    strategy that produces at least ``_MIN_SEGMENTS_FOR_OK`` non-trivial
+    segments. If none meet the threshold, returns the result of the last
+    strategy attempted (which always covers the full text).
+    """
+    last_result: list[StepSegment] = []
+    for name in _AUTO_CASCADE:
+        result = _SEGMENTER_REGISTRY[name](text)
+        last_result = result
+        if len(result) >= _MIN_SEGMENTS_FOR_OK:
+            return result
+    return last_result

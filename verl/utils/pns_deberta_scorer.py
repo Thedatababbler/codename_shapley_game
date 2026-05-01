@@ -35,6 +35,30 @@ NUM_CLASSES = 3
 PN_BINS = [0.0, 1.0, 2.0]
 
 
+def _resolve_dtype(name: Optional[str], device: torch.device) -> torch.dtype:
+    """Resolve a string dtype spec (``bf16``/``fp16``/``fp32``) to a torch dtype.
+
+    Defaults to bf16 on CUDA capability >= 8.0 (Ampere+), else fp16 on CUDA,
+    else fp32 on CPU.
+    """
+    if name:
+        key = name.strip().lower()
+        if key in ("bf16", "bfloat16"):
+            return torch.bfloat16
+        if key in ("fp16", "half", "float16"):
+            return torch.float16
+        if key in ("fp32", "float32"):
+            return torch.float32
+    if device.type != "cuda":
+        return torch.float32
+    try:
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+    except Exception:
+        pass
+    return torch.float16
+
+
 class DeBERTaPNScorer:
     """Wraps a 3-class DeBERTa checkpoint for step-level PNS scoring."""
 
@@ -44,13 +68,25 @@ class DeBERTaPNScorer:
         device: Optional[str] = None,
         max_length: int = 512,
         batch_size: int = 64,
+        dtype: Optional[str] = None,
+        attn_implementation: Optional[str] = None,
+        pad_to_multiple_of: int = 8,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.max_length = max_length
         self.batch_size = batch_size
+        self.pad_to_multiple_of = max(1, int(pad_to_multiple_of))
+        self.dtype = _resolve_dtype(dtype, self.device)
 
-        logger.info("Loading DeBERTa PNS scorer from %s on %s", checkpoint_dir, self.device)
+        logger.info(
+            "Loading DeBERTa PNS scorer from %s on %s (dtype=%s, attn=%s, batch=%d, max_len=%d)",
+            checkpoint_dir, self.device, self.dtype, attn_implementation or "default",
+            self.batch_size, self.max_length,
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
+        self.pad_token_id = self.tokenizer.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = 0
 
         meta_path = Path(checkpoint_dir) / "train_meta.json"
         if meta_path.exists():
@@ -63,18 +99,38 @@ class DeBERTaPNScorer:
             self.num_classes = NUM_CLASSES
             self.pn_bins = PN_BINS
 
+        attn_kwargs = {"attn_implementation": attn_implementation} if attn_implementation else {}
+
         ckpt_bin = Path(checkpoint_dir) / "pytorch_model.bin"
         if ckpt_bin.exists():
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(checkpoint_dir)
-            self.model = AutoModelForSequenceClassification.from_config(config)
+            try:
+                self.model = AutoModelForSequenceClassification.from_config(config, **attn_kwargs)
+            except (TypeError, ValueError) as e:
+                if attn_kwargs:
+                    logger.warning(
+                        "from_config with attn=%s failed (%s); falling back to default attention.",
+                        attn_implementation, e,
+                    )
+                self.model = AutoModelForSequenceClassification.from_config(config)
             state_dict = torch.load(ckpt_bin, map_location="cpu", weights_only=True)
             self.model.load_state_dict(state_dict)
         else:
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                checkpoint_dir, num_labels=self.num_classes
-            )
-        self.model.to(self.device).eval()
+            try:
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    checkpoint_dir, num_labels=self.num_classes, **attn_kwargs
+                )
+            except (TypeError, ValueError) as e:
+                if attn_kwargs:
+                    logger.warning(
+                        "from_pretrained with attn=%s failed (%s); falling back to default attention.",
+                        attn_implementation, e,
+                    )
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    checkpoint_dir, num_labels=self.num_classes
+                )
+        self.model.to(self.device, dtype=self.dtype).eval()
 
         self.score_map = PN_BINS[:self.num_classes]
         logger.info("Score map: class -> %s", self.score_map)
@@ -97,29 +153,61 @@ class DeBERTaPNScorer:
         parts.append(f"Current Step {step_idx}: {current_step}")
         return "\n".join(parts)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _score_formatted(self, formatted: list[str]) -> torch.Tensor:
+        """Score formatted texts using length-bucketed batching.
+
+        We tokenize the whole list **without** padding once, then sort indices by
+        token length and chunk them into batches. Each batch only pads to its
+        own longest sequence (rounded up to ``pad_to_multiple_of`` for tensor
+        cores). This dramatically reduces padding waste compared to the naive
+        contiguous-slice batching when input lengths vary widely (which is the
+        norm for step prefixes that grow with step index).
+        """
         if not formatted:
             return torch.tensor([], dtype=torch.float32)
 
-        all_scores: list[float] = []
-        for start in range(0, len(formatted), self.batch_size):
-            batch_texts = formatted[start : start + self.batch_size]
-            enc = self.tokenizer(
-                batch_texts,
-                max_length=self.max_length,
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
+        enc = self.tokenizer(
+            formatted,
+            max_length=self.max_length,
+            truncation=True,
+            padding=False,
+        )
+        input_ids_list: list[list[int]] = enc["input_ids"]
+        attention_mask_list: list[list[int]] = enc["attention_mask"]
+        n = len(input_ids_list)
+        lengths = [len(x) for x in input_ids_list]
+
+        order = sorted(range(n), key=lambda i: lengths[i])
+
+        scores_arr = [0.0] * n
+        pad_mult = self.pad_to_multiple_of
+
+        for start in range(0, n, self.batch_size):
+            chunk = order[start : start + self.batch_size]
+            chunk_len = max(lengths[i] for i in chunk)
+            if pad_mult > 1:
+                chunk_len = ((chunk_len + pad_mult - 1) // pad_mult) * pad_mult
+            chunk_len = min(chunk_len, self.max_length)
+
+            ids = torch.full(
+                (len(chunk), chunk_len), self.pad_token_id, dtype=torch.long
             )
-            input_ids = enc["input_ids"].to(self.device)
-            attention_mask = enc["attention_mask"].to(self.device)
+            mask = torch.zeros((len(chunk), chunk_len), dtype=torch.long)
+            for j, i in enumerate(chunk):
+                ll = lengths[i]
+                ids[j, :ll] = torch.as_tensor(input_ids_list[i], dtype=torch.long)
+                mask[j, :ll] = torch.as_tensor(attention_mask_list[i], dtype=torch.long)
 
-            logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits
-            pred_cls = logits.argmax(dim=-1).cpu().tolist()
-            all_scores.extend(self.score_map[c] for c in pred_cls)
+            ids = ids.to(self.device, non_blocking=True)
+            mask = mask.to(self.device, non_blocking=True)
 
-        return torch.tensor(all_scores, dtype=torch.float32)
+            logits = self.model(input_ids=ids, attention_mask=mask).logits
+            pred = logits.argmax(dim=-1).tolist()
+            for j, i in enumerate(chunk):
+                scores_arr[i] = self.score_map[pred[j]]
+
+        return torch.tensor(scores_arr, dtype=torch.float32)
 
     def _format_steps_for_sample(
         self,
@@ -196,6 +284,9 @@ def _get_singleton() -> DeBERTaPNScorer:
             device=os.environ.get("PNS_DEBERTA_DEVICE"),
             max_length=int(os.environ.get("PNS_DEBERTA_MAX_LENGTH", "512")),
             batch_size=int(os.environ.get("PNS_DEBERTA_BATCH_SIZE", "128")),
+            dtype=os.environ.get("PNS_DEBERTA_DTYPE"),
+            attn_implementation=os.environ.get("PNS_DEBERTA_ATTN", "sdpa"),
+            pad_to_multiple_of=int(os.environ.get("PNS_DEBERTA_PAD_MULTIPLE", "8")),
         )
     return _SINGLETON
 

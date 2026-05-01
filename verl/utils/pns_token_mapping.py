@@ -11,8 +11,10 @@ Two mapping strategies are provided:
    tokens), fall back to distributing steps proportionally by their character
    length.
 
-Both strategies **broadcast** the step reward to every token in the step
-(i.e. all tokens in a step get the same value), as recommended by spec §7.
+Both strategies **distribute** the step reward across the tokens that make up
+that step. To preserve reward conservation – i.e. ``sum_t r_t == sum_step
+step_reward`` – every token in a step's span receives an *equal share* of the
+step reward (``step_reward / span_length``), not the full ``step_reward``.
 """
 
 from __future__ import annotations
@@ -191,17 +193,23 @@ def broadcast_step_rewards_to_tokens(
     response_length: int,
     response_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Broadcast step-level rewards to a token-level reward tensor.
+    """Distribute step-level rewards across the tokens of each step span.
 
-    Each token in a step's span receives the step's reward value.
-    Tokens not covered by any step span receive 0.
+    For each step, the step reward is **evenly spread** over the tokens it
+    covers: every token in a span of length ``L`` receives ``step_reward / L``.
+    This preserves reward conservation: ``token_rewards.sum() ==
+    step_rewards.sum()`` (modulo masking and tokens outside any span, which
+    contribute zero).
 
     Args:
         step_rewards: Shape ``[T]``, one reward per step.
         token_spans: ``T`` tuples of ``(start, end)`` token indices.
         response_length: Total length of the padded response tensor.
         response_mask: Optional mask, shape ``[response_length]``.
-            If provided, rewards are zeroed out on masked positions.
+            If provided, rewards are zeroed out on masked positions. Note
+            that masking can break exact conservation if a step span overlaps
+            masked-out tokens; in practice valid response tokens fully cover
+            the relevant spans.
 
     Returns:
         Token-level reward tensor, shape ``[response_length]``.
@@ -209,9 +217,13 @@ def broadcast_step_rewards_to_tokens(
     token_rewards = torch.zeros(response_length, device=step_rewards.device, dtype=step_rewards.dtype)
 
     for step_idx, (start, end) in enumerate(token_spans):
-        if start < end and start < response_length:
-            actual_end = min(end, response_length)
-            token_rewards[start:actual_end] = step_rewards[step_idx]
+        if start >= end or start >= response_length:
+            continue
+        actual_end = min(end, response_length)
+        span_len = actual_end - start
+        if span_len <= 0:
+            continue
+        token_rewards[start:actual_end] = step_rewards[step_idx] / span_len
 
     if response_mask is not None:
         token_rewards = token_rewards * response_mask.float()
