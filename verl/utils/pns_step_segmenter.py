@@ -211,6 +211,47 @@ def _segment_numbered_marker(text: str) -> list[StepSegment]:
     return segments
 
 
+# Conservative inline numbered step markers.
+# Examples that match: "1. **Find the height**", "... area.2. Compute:"
+# Examples intentionally not matched: decimals like "1.5", citations, or
+# generic numbered text without a title cue.
+_INLINE_NUMBERED_MARKER_RE = re.compile(
+    r"(^|(?<=[.!?])\s*)"
+    r"(?=\d{1,2}\.\s+(?:\*\*[^*\n]{1,80}\*\*|[A-Z][^:\n]{1,80}:))"
+)
+
+
+@register_segmenter("inline_numbered_marker")
+def _segment_inline_numbered_marker(text: str) -> list[StepSegment]:
+    r"""Split on inline numbered reasoning markers without requiring newlines.
+
+    This catches rollout patterns like ``"... facts.1. **Determine ... 2. **Use ..."``
+    where the model emits clear numbered steps but omits line breaks. Matching
+    requires a title-like cue after ``N.`` to avoid splitting decimals or
+    ordinary numeric mentions.
+    """
+    positions = [m.end(1) for m in _INLINE_NUMBERED_MARKER_RE.finditer(text)]
+
+    if not positions:
+        if text.strip():
+            return [StepSegment(text=text, char_start=0, char_end=len(text))]
+        return []
+
+    segments: list[StepSegment] = []
+    if positions[0] > 0:
+        prefix = text[: positions[0]]
+        if prefix.strip():
+            segments.append(StepSegment(text=prefix, char_start=0, char_end=positions[0]))
+
+    for i, start in enumerate(positions):
+        end = positions[i + 1] if i + 1 < len(positions) else len(text)
+        seg_text = text[start:end]
+        if seg_text.strip():
+            segments.append(StepSegment(text=seg_text, char_start=start, char_end=end))
+
+    return segments
+
+
 @register_segmenter("single_newline")
 def _segment_single_newline(text: str) -> list[StepSegment]:
     r"""Split on any single ``\n`` (treats every non-empty line as a step).
@@ -234,6 +275,7 @@ _AUTO_CASCADE: tuple[str, ...] = (
     "double_newline",
     "numbered_marker",
     "step_marker",
+    "inline_numbered_marker",
     "single_newline",
     "sentence",
 )
@@ -244,10 +286,11 @@ def _segment_auto(text: str) -> list[StepSegment]:
     """Cascade segmenter with fallbacks.
 
     Tries strategies in order: ``double_newline`` → ``numbered_marker`` →
-    ``step_marker`` → ``single_newline`` → ``sentence``. Stops at the first
-    strategy that produces at least ``_MIN_SEGMENTS_FOR_OK`` non-trivial
-    segments. If none meet the threshold, returns the result of the last
-    strategy attempted (which always covers the full text).
+    ``step_marker`` → ``inline_numbered_marker`` → ``single_newline`` →
+    ``sentence``. Stops at the first strategy that produces at least
+    ``_MIN_SEGMENTS_FOR_OK`` non-trivial segments. If none meet the threshold,
+    returns the result of the last strategy attempted (which always covers the
+    full text).
     """
     last_result: list[StepSegment] = []
     for name in _AUTO_CASCADE:
