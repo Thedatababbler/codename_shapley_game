@@ -229,6 +229,115 @@ With pytest (if available):
 pytest tests/utils/test_pns_reward_allocation.py -v
 ```
 
+## Step-Prompt Evaluation Scripts
+
+The repository includes helper scripts for evaluating whether GRPO/PNS
+checkpoints can solve the validation set while producing explicit, parseable
+reasoning steps. These scripts are intended for controlled comparisons where
+baseline checkpoints are prompted to output `Step 1:`, `Step 2:`, ... style
+reasoning before the final answer.
+
+### 1. Create step-prompt validation data
+
+```bash
+python scripts/create_step_prompt_validation_data.py
+```
+
+This writes:
+
+| File | Description |
+|------|-------------|
+| `data/step_prompt_eval/gsm8k_test.parquet` | GSM8K validation prompts with explicit `Step N:` and `#### <answer>` requirements |
+| `data/step_prompt_eval/math_test.parquet` | MATH validation prompts with explicit `Step N:` and `\boxed{}` requirements |
+
+### 2. Direct single-GPU vLLM evaluation
+
+For fast evaluation on a single GPU node, use the vLLM direct evaluator. The
+script downloads the uploaded Verl actor checkpoint from Hugging Face if needed,
+merges FSDP actor shards into a standard Hugging Face model, runs vLLM
+generation, and writes JSONL outputs plus a CSV summary.
+
+```bash
+sbatch \
+  --partition=rp6b-1-gm96-c8-m64 \
+  --nodelist=rp6b-1-gm96-c8-m64-dy-g7e-2xlarge-1 \
+  --cpus-per-task=8 \
+  --mem=60G \
+  --gpus=1 \
+  --export=ALL,GRPO_STEP_PROMPT_VARIANT=native,HF_TOKEN="$HF_TOKEN",HF_HUB_DISABLE_XET=1 \
+  scripts/run_direct_grpo_step_prompt_eval_vllm.sh
+```
+
+Set `GRPO_STEP_PROMPT_VARIANT` to:
+
+| Variant | Checkpoint source |
+|---------|-------------------|
+| `native` | `drdoggo/pns_grpo_native/global_step_200` |
+| `format_length` | `drdoggo/pns_grpo_format_length/global_step_200` |
+
+Outputs are written under:
+
+```text
+outputs/direct_step_prompt_eval_vllm/<variant>_<job_id>/
+├── global_step_200.jsonl
+└── summary.csv
+```
+
+`summary.csv` reports per-dataset and overall metrics:
+
+- total sample count
+- number and rate of `Step N:` compliant responses
+- score over all responses
+- score over step-compliant responses only
+- output length
+- average number of step markers
+
+### 3. Direct Transformers fallback
+
+If vLLM is unavailable, the slower Transformers-based evaluator can be used:
+
+```bash
+bash scripts/run_direct_grpo_step_prompt_eval.sh
+```
+
+This path is useful for debugging but is much slower for full GSM8K+MATH
+evaluation.
+
+### 4. Verl val-only evaluation
+
+For validation through the normal Verl trainer stack, use:
+
+```bash
+sbatch --array=0-1 scripts/validate_grpo_step_prompt.sh
+```
+
+This runs `trainer.val_only=True` on the baseline checkpoints. It requires the
+checkpoint world size to match the requested GPU layout, so it is less flexible
+than the direct vLLM evaluator for single-GPU nodes.
+
+To validate existing PNS checkpoints, use:
+
+```bash
+sbatch --array=0-1 --export=ALL,PNS_VAL_STEPS="1500 1600" scripts/validate_pns_checkpoint.sh
+```
+
+### 5. Summarize JSONL outputs
+
+Any step-prompt JSONL dump can be summarized with:
+
+```bash
+python scripts/summarize_step_prompt_validation.py \
+  outputs/direct_step_prompt_eval_vllm/native_<job_id>/global_step_200.jsonl
+```
+
+To write a CSV file:
+
+```bash
+python scripts/summarize_step_prompt_validation.py \
+  outputs/direct_step_prompt_eval_vllm/native_<job_id>/global_step_200.jsonl \
+  --output outputs/direct_step_prompt_eval_vllm/native_<job_id>/summary.csv
+```
+
 ## Configuration Reference
 
 | Parameter | Type | Default | Description |
